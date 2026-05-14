@@ -1,4 +1,4 @@
-cat > /home/claude/vinted-bot/bot.py << 'ENDOFFILE'
+
 import requests
 import time
 import os
