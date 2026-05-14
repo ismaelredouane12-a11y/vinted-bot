@@ -1,9 +1,9 @@
+cat > /home/claude/vinted-bot/bot.py << 'ENDOFFILE'
 import requests
 import time
 import os
 import asyncio
 import sys
-from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -59,11 +59,17 @@ MARQUES_HYPE_BONUS = {
     "yeezy", "bape", "jordan", "air jordan", "represent", "minus two",
 }
 
-# Tailles rares qui méritent un bonus de score
-TAILLES_RARES = {"xxs", "xs", "3xl", "4xl", "5xl", "xxl", "xxxl", "6", "6.5", "13", "14", "15"}
+# Bonus état article
+ETAT_BONUS = {
+    "neuf avec étiquettes": 12,
+    "neuf sans étiquettes": 10,
+    "très bon état":         6,
+    "bon état":              2,
+    "satisfaisant":         -3,
+}
 
-# États qui méritent un bonus de score
-ETATS_PREMIUM = {"neuf avec étiquette", "neuf sans étiquette", "très bon état"}
+# Tailles courantes = plus liquides = bonus
+TAILLES_POPULAIRES = {"s", "m", "l", "xl", "42", "44", "38", "40", "36"}
 
 REGLES_MARGE = {
     "chrome hearts":     (2.5, 30), "hellstar":          (2.5, 25),
@@ -98,18 +104,6 @@ REGLES_MARGE = {
     "_defaut":           (1.4,  8),
 }
 
-# Base de prix moyens de revente par marque (prix marché indicatif)
-PRIX_MARCHE = {
-    "chrome hearts": 400, "hellstar": 120, "gallery dept": 250,
-    "rick owens": 350, "drkshdw": 200, "supreme": 150, "palace": 100,
-    "off-white": 200, "yeezy": 180, "jordan": 120, "air jordan": 120,
-    "balenciaga": 400, "moncler": 600, "canada goose": 400,
-    "stone island": 200, "cp company": 150, "arc'teryx": 250,
-    "north face": 80, "nike": 80, "adidas": 70, "new balance": 90,
-    "ralph lauren": 60, "lacoste": 50, "carhartt": 60,
-    "ami paris": 130, "jacquemus": 150, "sandro": 100,
-}
-
 SEARCH_QUERIES = [
     "nike", "adidas", "jordan", "new balance", "stone island",
     "lacoste", "ralph lauren", "tommy hilfiger", "supreme", "palace",
@@ -125,23 +119,25 @@ SEARCH_QUERIES = [
 # ══════════════════════════════════════════════════════════════════════════════
 config = {
     "actif":            False,
-    "msg_cooldown":     1,       # secondes entre chaque message Telegram
+    "msg_cooldown":     1,      # délai entre messages Telegram (secondes)
     "prix_min":         3.0,
     "prix_max":         200.0,
-    "score_min":        60,      # score /100 minimum pour alerter
+    "score_min":        60,
     "marques":          set(TOUTES_LES_MARQUES),
-    # sous-menus panel
-    "menu_actif":       "main",  # main | scan | budget | score | marques | historique | favoris
 }
 
-seen_ids: set = set()
-historique_alertes: deque = deque(maxlen=50)  # 50 dernières alertes
-favoris: list = []  # annonces mises en favoris
+seen_ids: set       = set()
+favoris: list       = []          # stockage en mémoire
+historique: list    = []          # dernières alertes (max 20)
+stats = {"scans": 0, "alertes": 0, "filtres": 0}
+
+# Vue active du panel : "main" | "cooldown" | "budget" | "score" | "favoris" | "historique"
+panel_view: dict = {}   # message_id → vue active
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCRAPER
 # ══════════════════════════════════════════════════════════════════════════════
-def _make_session() -> requests.Session:
+def _make_session():
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -184,64 +180,47 @@ def _fetch_sync(query: str) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCORE /100 INTELLIGENT
 # ══════════════════════════════════════════════════════════════════════════════
-def calculer_score(prix: float, revente: float, marge: float,
-                   marque: str, titre: str, taille: str, etat: str) -> int:
-    """
-    Score /100 basé sur :
-    - ratio marge/prix          → 0-35 pts
-    - marge absolue             → 0-20 pts
-    - comparaison prix marché   → 0-10 pts
-    - bonus marque hype         → 0-15 pts
-    - bonus keywords hype       → 0-8  pts
-    - bonus sous-côte extrême   → 0-6  pts
-    - bonus état (neuf/TBE)     → 0-4  pts
-    - bonus taille rare         → 0-2  pts
-    """
-    t = titre.lower()
+def calculer_score(prix, revente, marge, marque, titre, etat, taille) -> int:
+    t     = titre.lower()
     score = 0
 
-    # 1. Ratio marge/prix
+    # 1. Ratio marge/prix — cœur du score (0-40 pts)
     ratio = marge / prix if prix > 0 else 0
-    score += min(35, int(ratio * 55))
+    score += min(40, int(ratio * 65))
 
-    # 2. Marge absolue
-    if   marge >= 100: score += 20
-    elif marge >= 50:  score += 15
-    elif marge >= 30:  score += 10
-    elif marge >= 20:  score += 7
-    elif marge >= 10:  score += 4
+    # 2. Marge absolue (0-20 pts)
+    if   marge >= 150: score += 20
+    elif marge >= 100: score += 16
+    elif marge >= 50:  score += 12
+    elif marge >= 30:  score += 8
+    elif marge >= 15:  score += 4
 
-    # 3. Comparaison au prix de marché (confiance)
-    prix_marche = PRIX_MARCHE.get(marque)
-    if prix_marche and prix_marche > 0:
-        ratio_marche = prix / prix_marche
-        if   ratio_marche <= 0.20: score += 10
-        elif ratio_marche <= 0.35: score += 7
-        elif ratio_marche <= 0.50: score += 4
-
-    # 4. Bonus marque hype
+    # 3. Bonus marque hype (0-15 pts)
     if marque in MARQUES_HYPE_BONUS:
         score += 15
     elif marque in REGLES_MARGE and REGLES_MARGE[marque][0] >= 1.8:
         score += 8
 
-    # 5. Bonus keywords hype dans le titre
-    hype_count = sum(1 for k in KEYWORDS_HYPE if k in t)
-    score += min(8, hype_count * 3)
+    # 4. Bonus keywords hype dans titre (0-10 pts)
+    score += min(10, sum(1 for k in KEYWORDS_HYPE if k in t) * 4)
 
-    # 6. Bonus sous-côte extrême
-    if   revente > prix * 3.0: score += 6
-    elif revente > prix * 2.5: score += 4
+    # 5. Bonus sous-côte extrême (0-8 pts)
+    if   revente > prix * 3.5: score += 8
+    elif revente > prix * 3.0: score += 6
+    elif revente > prix * 2.5: score += 3
 
-    # 7. Bonus état
-    if etat.lower() in ETATS_PREMIUM:
-        score += 4
+    # 6. Bonus état article (0-12 pts)
+    etat_lower = (etat or "").lower()
+    for k, v in ETAT_BONUS.items():
+        if k in etat_lower:
+            score += v
+            break
 
-    # 8. Bonus taille rare
-    if taille.lower().strip() in TAILLES_RARES:
-        score += 2
+    # 7. Bonus taille populaire (+3 pts)
+    if taille and taille.lower().strip() in TAILLES_POPULAIRES:
+        score += 3
 
-    return min(100, score)
+    return max(0, min(100, score))
 
 def niveau_affaire(score: int) -> str:
     if score >= 90: return "💎 PÉPITE EXTRÊME"
@@ -253,14 +232,14 @@ def niveau_affaire(score: int) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 #  FILTRAGE & ANALYSE
 # ══════════════════════════════════════════════════════════════════════════════
-def extraire_prix(item: dict) -> float | None:
+def extraire_prix(item):
     try:
         raw = item.get("price", {})
         return float(raw.get("amount", 0) if isinstance(raw, dict) else raw)
     except (TypeError, ValueError):
         return None
 
-def detecter_marque(titre: str, marque_vinted: str) -> str | None:
+def detecter_marque(titre, marque_vinted):
     t = titre.lower()
     m = marque_vinted.lower().strip()
     for marque in config["marques"]:
@@ -268,10 +247,10 @@ def detecter_marque(titre: str, marque_vinted: str) -> str | None:
             return marque
     return None
 
-def analyser(item: dict) -> tuple[bool, dict]:
+def analyser(item):
     titre      = item.get("title", "") or ""
     marque_raw = item.get("brand_title", "") or ""
-    taille     = item.get("size_title", "?") or "?"
+    taille     = item.get("size_title", "?")
     etat       = item.get("status", "") or ""
     prix       = extraire_prix(item)
     item_id    = item.get("id")
@@ -294,88 +273,38 @@ def analyser(item: dict) -> tuple[bool, dict]:
     if marge < marge_min:
         return False, {}
 
-    score = calculer_score(prix, revente, marge, marque, titre, taille, etat)
+    score = calculer_score(prix, revente, marge, marque, titre, etat, taille)
     if score < config["score_min"]:
         return False, {}
 
-    data = {
-        "id":      item_id,
-        "titre":   titre,
-        "marque":  marque_raw or marque,
-        "taille":  taille,
-        "etat":    etat,
-        "prix":    prix,
-        "revente": revente,
-        "marge":   marge,
-        "score":   score,
-        "niveau":  niveau_affaire(score),
-        "url":     f"https://www.vinted.fr/items/{item_id}",
-        "heure":   time.strftime("%H:%M:%S"),
+    return True, {
+        "titre":    titre,
+        "marque":   marque_raw or marque,
+        "taille":   taille,
+        "etat":     etat,
+        "prix":     prix,
+        "revente":  revente,
+        "marge":    marge,
+        "score":    score,
+        "niveau":   niveau_affaire(score),
+        "url":      f"https://www.vinted.fr/items/{item_id}",
+        "item_id":  item_id,
     }
-    return True, data
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MESSAGE TELEGRAM
-# ══════════════════════════════════════════════════════════════════════════════
-def formater_alerte(d: dict, idx: int | None = None) -> str:
-    fav_btn_hint = f"\n<i>💾 Utilise /bot → Favoris pour sauvegarder</i>" if idx is None else ""
-    return (
-        f"{d['niveau']} — <b>{d['score']}/100</b>\n\n"
-        f"👕 <b>{d['titre']}</b>\n"
-        f"🏷️ Marque : {d['marque']}\n"
-        f"📐 Taille : {d['taille']}\n"
-        f"✨ État : {d['etat'] or 'Non précisé'}\n"
-        f"💶 Prix achat : <b>{d['prix']}€</b>\n"
-        f"📈 Revente estimée : ~{d['revente']}€\n"
-        f"💰 Marge nette : ~<b>{d['marge']}€</b>\n"
-        f"🕐 {d['heure']}\n\n"
-        f"🔗 <a href='{d['url']}'>Voir l'annonce</a>"
-        f"{fav_btn_hint}"
-    )
-
-def build_alerte_keyboard(item_id) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⭐ Ajouter aux favoris", callback_data=f"fav_add_{item_id}"),
-    ]])
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BOUCLE DE SCAN (scan continu, cooldown uniquement entre messages)
+#  BOUCLE DE SCAN — continu, sans cooldown global
 # ══════════════════════════════════════════════════════════════════════════════
 async def boucle_scan(app: Application):
     loop = asyncio.get_event_loop()
-    # File d'attente pour les alertes à envoyer
-    alert_queue: asyncio.Queue = asyncio.Queue()
-
-    # Tâche expéditrice : envoie les messages avec cooldown
-    async def expediteur():
-        while True:
-            d = await alert_queue.get()
-            msg    = formater_alerte(d)
-            markup = build_alerte_keyboard(d["id"])
-            try:
-                await app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=msg,
-                    parse_mode="HTML",
-                    disable_web_page_preview=False,
-                    reply_markup=markup,
-                )
-            except Exception as e:
-                print(f"❌ Telegram: {e}")
-            # Cooldown adaptatif : augmente si la file est longue
-            qs = alert_queue.qsize()
-            delay = config["msg_cooldown"] * (1 + qs // 5)
-            await asyncio.sleep(min(delay, 5))
-
-    asyncio.create_task(expediteur())
 
     while True:
         if not config["actif"]:
             await asyncio.sleep(3)
             continue
 
-        print(f"\n🔍 Scan — {time.strftime('%H:%M:%S')}")
-        alertes = 0
+        stats["scans"] += 1
+        print(f"\n🔍 Scan #{stats['scans']} — {time.strftime('%H:%M:%S')}")
+        alertes_scan = 0
 
         for query in SEARCH_QUERIES:
             if not config["actif"]:
@@ -391,300 +320,329 @@ async def boucle_scan(app: Application):
                 if not item_id or item_id in seen_ids:
                     continue
                 seen_ids.add(item_id)
+                if len(seen_ids) > 50000:
+                    seen_ids.clear()
 
-                if len(seen_ids) > 50_000:
-                    # Garde les 25 000 plus récents
-                    seen_ids.difference_update(list(seen_ids)[:25_000])
-
+                stats["filtres"] += 1
                 ok, d = analyser(item)
                 if not ok:
                     continue
 
-                alertes += 1
-                historique_alertes.appendleft(d)
-                await alert_queue.put(d)
-                print(f"  🚨 {d['titre'][:45]} | score {d['score']}/100 | ~{d['marge']}€")
+                alertes_scan     += 1
+                stats["alertes"] += 1
 
-            # Petit délai entre requêtes pour ne pas spammer l'API
-            await asyncio.sleep(1)
+                # Historique (max 20)
+                historique.insert(0, d)
+                if len(historique) > 20:
+                    historique.pop()
 
-        print(f"✅ Cycle terminé — {alertes} nouvelles alertes")
-        # Scan continu : pas de cooldown entre cycles, seulement 1s de respiration
-        await asyncio.sleep(1)
+                msg = (
+                    f"{d['niveau']} — <b>{d['score']}/100</b>\n\n"
+                    f"👕 <b>{d['titre']}</b>\n"
+                    f"🏷️ Marque : {d['marque']}\n"
+                    f"📐 Taille : {d['taille']}  |  🏅 État : {d['etat']}\n"
+                    f"💶 Prix achat : <b>{d['prix']}€</b>\n"
+                    f"📈 Revente estimée : ~<b>{d['revente']}€</b>\n"
+                    f"💰 Marge nette : ~<b>{d['marge']}€</b>\n\n"
+                    f"🔗 <a href='{d['url']}'>Voir l'annonce</a>"
+                )
+                print(f"  🚨 {d['titre'][:45]} | {d['score']}/100 | marge ~{d['marge']}€")
+                try:
+                    sent = await app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=msg,
+                        parse_mode="HTML",
+                        disable_web_page_preview=False,
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⭐ Ajouter aux favoris", callback_data=f"fav_add_{item_id}")
+                        ]])
+                    )
+                except Exception as e:
+                    print(f"❌ Telegram: {e}")
+
+                # Cooldown entre messages uniquement
+                await asyncio.sleep(config["msg_cooldown"])
+
+            await asyncio.sleep(2)  # pause polie entre requêtes Vinted
+
+        print(f"✅ Scan #{stats['scans']} terminé — {alertes_scan} alertes")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PANEL /bot — MENU PRINCIPAL
+#  PANEL /bot — VUES MULTIPLES
 # ══════════════════════════════════════════════════════════════════════════════
-def build_main_text() -> str:
-    etat = "✅ Actif" if config["actif"] else "⏸ En pause"
-    nb_fav = len(favoris)
-    nb_hist = len(historique_alertes)
+def _fmt_cooldown(s):
+    return f"{s}s" if s < 60 else f"{s//60}min"
+
+def panel_main_text():
+    etat    = "✅ EN COURS" if config["actif"] else "⏸ EN PAUSE"
+    uptime  = f"Scan #{stats['scans']} | {stats['alertes']} alertes envoyées"
     return (
-        f"🤖 <b>Vinted Bot — Panel de contrôle</b>\n"
-        f"{'─' * 32}\n"
-        f"{'🟢' if config['actif'] else '🔴'} État          : <b>{etat}</b>\n"
-        f"📨 Cooldown msg : <b>{config['msg_cooldown']}s</b>\n"
-        f"💶 Budget        : <b>{config['prix_min']}€ – {config['prix_max']}€</b>\n"
-        f"🎯 Score min     : <b>{config['score_min']}/100</b>\n"
-        f"🏷️ Marques        : <b>{len(config['marques'])}</b>\n"
-        f"📋 Historique    : <b>{nb_hist}</b> alertes\n"
-        f"⭐ Favoris       : <b>{nb_fav}</b> annonces\n"
-        f"{'─' * 32}\n"
-        f"<i>Choisis une catégorie ci-dessous :</i>"
+        f"╔══════════════════════╗\n"
+        f"║   🤖  VINTED BOT     ║\n"
+        f"╚══════════════════════╝\n\n"
+        f"<b>État :</b> {etat}\n"
+        f"<b>📊</b> {uptime}\n\n"
+        f"<b>⏱ Cooldown msg :</b> {_fmt_cooldown(config['msg_cooldown'])}\n"
+        f"<b>💶 Budget :</b> {config['prix_min']}€ – {config['prix_max']}€\n"
+        f"<b>🎯 Score min :</b> {config['score_min']}/100\n"
+        f"<b>🏷️ Marques :</b> {len(config['marques'])} actives\n"
+        f"<b>⭐ Favoris :</b> {len(favoris)}\n\n"
+        f"<i>Sélectionne une section :</i>"
     )
 
-def build_main_keyboard() -> InlineKeyboardMarkup:
-    etat_btn = "⏸ Pause" if config["actif"] else "▶️ Démarrer"
+def panel_main_kb():
+    etat_btn = "⏸ Pause" if config["actif"] else "▶️ Start"
     etat_cb  = "panel_pause" if config["actif"] else "panel_start"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(etat_btn, callback_data=etat_cb),
-            InlineKeyboardButton("⏹ Arrêter", callback_data="panel_stop"),
+            InlineKeyboardButton(etat_btn,    callback_data=etat_cb),
+            InlineKeyboardButton("⏹ Stop",    callback_data="panel_stop"),
         ],
         [
-            InlineKeyboardButton("📡 Scan",         callback_data="menu_scan"),
-            InlineKeyboardButton("💶 Budget",        callback_data="menu_budget"),
-            InlineKeyboardButton("🎯 Score",         callback_data="menu_score"),
+            InlineKeyboardButton("⏱ Cooldown msg",  callback_data="view_cooldown"),
+            InlineKeyboardButton("💶 Budget",        callback_data="view_budget"),
         ],
         [
-            InlineKeyboardButton("🏷️ Marques",        callback_data="menu_marques"),
-            InlineKeyboardButton("📋 Historique",    callback_data="menu_historique"),
-            InlineKeyboardButton("⭐ Favoris",       callback_data="menu_favoris"),
+            InlineKeyboardButton("🎯 Score min",     callback_data="view_score"),
+            InlineKeyboardButton("🏷️ Marques",      callback_data="view_marques"),
         ],
         [
-            InlineKeyboardButton("🔁 Reset config",  callback_data="panel_reset"),
-            InlineKeyboardButton("🔄 Actualiser",    callback_data="menu_main"),
+            InlineKeyboardButton("⭐ Favoris",       callback_data="view_favoris"),
+            InlineKeyboardButton("📋 Historique",    callback_data="view_historique"),
+        ],
+        [
+            InlineKeyboardButton("♻️ Reset config",  callback_data="panel_reset"),
+            InlineKeyboardButton("🔄 Actualiser",    callback_data="panel_refresh"),
         ],
     ])
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUS-MENU : SCAN (cooldown messages)
-# ══════════════════════════════════════════════════════════════════════════════
-def build_scan_text() -> str:
+def panel_cooldown_text():
     return (
-        f"📡 <b>Paramètres de scan</b>\n"
-        f"{'─' * 30}\n"
-        f"⚡ Le scan tourne en <b>continu</b> (pas de cooldown entre cycles)\n\n"
-        f"📨 Cooldown entre messages : <b>{config['msg_cooldown']}s</b>\n"
-        f"   <i>(augmente automatiquement si trop d'alertes)</i>\n"
-        f"{'─' * 30}\n"
-        f"<i>Choisis le délai entre messages :</i>"
+        f"⏱ <b>Cooldown entre messages</b>\n\n"
+        f"Actuel : <b>{_fmt_cooldown(config['msg_cooldown'])}</b>\n\n"
+        f"Choisir un délai :"
     )
 
-def build_scan_keyboard() -> InlineKeyboardMarkup:
-    cd = config["msg_cooldown"]
-    def mark(v): return f"✅ {v}s" if cd == v else f"{v}s"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(mark(1),  callback_data="msgcd_1"),
-            InlineKeyboardButton(mark(2),  callback_data="msgcd_2"),
-            InlineKeyboardButton(mark(3),  callback_data="msgcd_3"),
-        ],
-        [
-            InlineKeyboardButton(mark(5),  callback_data="msgcd_5"),
-            InlineKeyboardButton(mark(10), callback_data="msgcd_10"),
-            InlineKeyboardButton(mark(30), callback_data="msgcd_30"),
-        ],
-        [InlineKeyboardButton("◀️ Retour", callback_data="menu_main")],
-    ])
+def panel_cooldown_kb():
+    options = [1, 2, 3, 5, 10, 30]
+    rows = []
+    row = []
+    for s in options:
+        mark = "✅ " if config["msg_cooldown"] == s else ""
+        row.append(InlineKeyboardButton(f"{mark}{_fmt_cooldown(s)}", callback_data=f"cd_{s}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("◀️ Retour", callback_data="view_main")])
+    return InlineKeyboardMarkup(rows)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUS-MENU : BUDGET
-# ══════════════════════════════════════════════════════════════════════════════
-def build_budget_text() -> str:
+def panel_budget_text():
     return (
-        f"💶 <b>Filtre budget</b>\n"
-        f"{'─' * 30}\n"
-        f"Actuel : <b>{config['prix_min']}€ – {config['prix_max']}€</b>\n"
-        f"{'─' * 30}\n"
-        f"<i>Choisis une plage de prix :</i>"
+        f"💶 <b>Budget</b>\n\n"
+        f"Actuel : <b>{config['prix_min']}€ – {config['prix_max']}€</b>\n\n"
+        f"Sélectionner une fourchette :"
     )
 
-def build_budget_keyboard() -> InlineKeyboardMarkup:
-    cur = (config["prix_min"], config["prix_max"])
-    def mark(a, b): return f"✅ {a}–{b}€" if cur == (float(a), float(b)) else f"{a}–{b}€"
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(mark(3,  30),  callback_data="budget_3_30"),
-            InlineKeyboardButton(mark(3,  50),  callback_data="budget_3_50"),
-            InlineKeyboardButton(mark(5,  50),  callback_data="budget_5_50"),
-        ],
-        [
-            InlineKeyboardButton(mark(5,  100), callback_data="budget_5_100"),
-            InlineKeyboardButton(mark(5,  150), callback_data="budget_5_150"),
-            InlineKeyboardButton(mark(5,  200), callback_data="budget_5_200"),
-        ],
-        [
-            InlineKeyboardButton(mark(10, 300), callback_data="budget_10_300"),
-            InlineKeyboardButton(mark(10, 500), callback_data="budget_10_500"),
-        ],
-        [InlineKeyboardButton("◀️ Retour", callback_data="menu_main")],
-    ])
+def panel_budget_kb():
+    presets = [("5–50€", 5, 50), ("5–100€", 5, 100), ("5–150€", 5, 150),
+               ("5–200€", 5, 200), ("10–300€", 10, 300), ("3–500€", 3, 500)]
+    rows = []
+    row  = []
+    for label, pmin, pmax in presets:
+        mark = "✅ " if config["prix_min"] == pmin and config["prix_max"] == pmax else ""
+        row.append(InlineKeyboardButton(f"{mark}{label}", callback_data=f"budget_{pmin}_{pmax}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("◀️ Retour", callback_data="view_main")])
+    return InlineKeyboardMarkup(rows)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUS-MENU : SCORE
-# ══════════════════════════════════════════════════════════════════════════════
-def build_score_text() -> str:
-    s = config["score_min"]
-    explication = {
-        range(30, 50): "🟡 Mode large — beaucoup d'alertes",
-        range(50, 65): "🟠 Mode équilibré — recommandé",
-        range(65, 80): "🔴 Mode strict — bonnes affaires sûres",
-        range(80, 96): "💎 Mode expert — pépites seulement",
-    }
-    desc = next((v for k, v in explication.items() if s in k), "")
+def panel_score_text():
     return (
-        f"🎯 <b>Score minimum</b>\n"
-        f"{'─' * 30}\n"
-        f"Score actuel : <b>{s}/100</b>\n"
-        f"{desc}\n"
-        f"{'─' * 30}\n"
-        f"<i>Ajuste le seuil :</i>"
+        f"🎯 <b>Score minimum</b>\n\n"
+        f"Actuel : <b>{config['score_min']}/100</b>\n\n"
+        f"Plus le score est élevé, moins d'alertes mais plus de qualité.\n\n"
+        f"  30 = tout passe\n"
+        f"  50 = bonnes affaires\n"
+        f"  65 = très bonnes affaires\n"
+        f"  78 = énormes affaires seulement\n"
+        f"  90 = pépites uniquement"
     )
 
-def build_score_keyboard() -> InlineKeyboardMarkup:
-    s = config["score_min"]
-    def mark(v): return f"✅ {v}" if s == v else str(v)
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(mark(40), callback_data="score_set_40"),
-            InlineKeyboardButton(mark(50), callback_data="score_set_50"),
-            InlineKeyboardButton(mark(55), callback_data="score_set_55"),
-            InlineKeyboardButton(mark(60), callback_data="score_set_60"),
-        ],
-        [
-            InlineKeyboardButton(mark(65), callback_data="score_set_65"),
-            InlineKeyboardButton(mark(70), callback_data="score_set_70"),
-            InlineKeyboardButton(mark(75), callback_data="score_set_75"),
-            InlineKeyboardButton(mark(80), callback_data="score_set_80"),
-        ],
-        [
-            InlineKeyboardButton("▼ -5", callback_data="score_down"),
-            InlineKeyboardButton(f"  {s}/100  ", callback_data="noop"),
-            InlineKeyboardButton("▲ +5", callback_data="score_up"),
-        ],
-        [InlineKeyboardButton("◀️ Retour", callback_data="menu_main")],
+def panel_score_kb():
+    presets = [30, 40, 50, 60, 65, 70, 78, 85, 90]
+    rows = []
+    row  = []
+    for s in presets:
+        mark = "✅ " if config["score_min"] == s else ""
+        row.append(InlineKeyboardButton(f"{mark}{s}", callback_data=f"score_{s}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([
+        InlineKeyboardButton("▼ -5", callback_data="score_down"),
+        InlineKeyboardButton("▲ +5", callback_data="score_up"),
+        InlineKeyboardButton("◀️ Retour", callback_data="view_main"),
     ])
+    return InlineKeyboardMarkup(rows)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUS-MENU : MARQUES
-# ══════════════════════════════════════════════════════════════════════════════
-def build_marques_text() -> str:
-    nb = len(config["marques"])
-    total = len(TOUTES_LES_MARQUES)
-    return (
-        f"🏷️ <b>Gestion des marques</b>\n"
-        f"{'─' * 30}\n"
-        f"Actives : <b>{nb}/{total}</b> marques\n"
-        f"{'─' * 30}\n"
-        f"<i>Utilise /marque add &lt;nom&gt; ou /marque remove &lt;nom&gt; pour modifier.\n"
-        f"/marque list pour voir la liste complète.</i>"
-    )
-
-def build_marques_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔁 Réinitialiser toutes les marques", callback_data="marques_reset")],
-        [InlineKeyboardButton("◀️ Retour", callback_data="menu_main")],
-    ])
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUS-MENU : HISTORIQUE
-# ══════════════════════════════════════════════════════════════════════════════
-def build_historique_text() -> str:
-    if not historique_alertes:
-        return "📋 <b>Historique des alertes</b>\n\nAucune alerte pour le moment."
-    lines = [f"📋 <b>Historique — {len(historique_alertes)} dernières alertes</b>\n{'─' * 30}"]
-    for i, d in enumerate(list(historique_alertes)[:10], 1):
-        lines.append(
-            f"\n<b>{i}.</b> {d['niveau']} <b>{d['score']}/100</b>\n"
-            f"   {d['titre'][:35]} | {d['prix']}€ → ~{d['marge']}€ marge\n"
-            f"   🕐 {d['heure']} — <a href='{d['url']}'>Voir</a>"
-        )
-    if len(historique_alertes) > 10:
-        lines.append(f"\n<i>... et {len(historique_alertes) - 10} de plus</i>")
-    return "\n".join(lines)
-
-def build_historique_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑️ Vider l'historique", callback_data="historique_clear")],
-        [InlineKeyboardButton("◀️ Retour", callback_data="menu_main")],
-    ])
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SOUS-MENU : FAVORIS
-# ══════════════════════════════════════════════════════════════════════════════
-def build_favoris_text() -> str:
+def panel_favoris_text():
     if not favoris:
-        return "⭐ <b>Favoris</b>\n\nAucun favori enregistré.\n\n<i>Clique sur ⭐ dans une alerte pour ajouter.</i>"
-    lines = [f"⭐ <b>Favoris — {len(favoris)} annonces</b>\n{'─' * 30}"]
-    for i, d in enumerate(favoris, 1):
-        lines.append(
-            f"\n<b>{i}.</b> {d['niveau']} <b>{d['score']}/100</b>\n"
-            f"   {d['titre'][:35]}\n"
-            f"   💶 {d['prix']}€ | 💰 ~{d['marge']}€ | 🕐 {d['heure']}\n"
-            f"   <a href='{d['url']}'>Voir l'annonce</a>"
-        )
+        return "⭐ <b>Favoris</b>\n\nAucun favori pour le moment.\nAjoute des annonces depuis les alertes."
+    lines = [f"⭐ <b>Favoris ({len(favoris)})</b>\n"]
+    for i, d in enumerate(favoris[:10], 1):
+        lines.append(f"{i}. <a href='{d['url']}'>{d['titre'][:35]}</a> — {d['prix']}€ | marge ~{d['marge']}€")
     return "\n".join(lines)
 
-def build_favoris_keyboard() -> InlineKeyboardMarkup:
-    buttons = []
-    for i, d in enumerate(favoris[:8]):
-        buttons.append([InlineKeyboardButton(
-            f"🗑️ Supprimer #{i+1} — {d['titre'][:25]}",
-            callback_data=f"fav_del_{i}"
-        )])
-    buttons.append([InlineKeyboardButton("🗑️ Vider tous les favoris", callback_data="fav_clear")])
-    buttons.append([InlineKeyboardButton("◀️ Retour", callback_data="menu_main")])
-    return InlineKeyboardMarkup(buttons)
+def panel_favoris_kb():
+    rows = []
+    if favoris:
+        rows.append([InlineKeyboardButton("🗑 Vider les favoris", callback_data="fav_clear")])
+    rows.append([InlineKeyboardButton("◀️ Retour", callback_data="view_main")])
+    return InlineKeyboardMarkup(rows)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ROUTEUR DE MENU
-# ══════════════════════════════════════════════════════════════════════════════
-MENUS = {
-    "main":       (build_main_text,       build_main_keyboard),
-    "scan":       (build_scan_text,        build_scan_keyboard),
-    "budget":     (build_budget_text,      build_budget_keyboard),
-    "score":      (build_score_text,       build_score_keyboard),
-    "marques":    (build_marques_text,     build_marques_keyboard),
-    "historique": (build_historique_text,  build_historique_keyboard),
-    "favoris":    (build_favoris_text,     build_favoris_keyboard),
+def panel_historique_text():
+    if not historique:
+        return "📋 <b>Historique</b>\n\nAucune alerte pour le moment."
+    lines = [f"📋 <b>Dernières alertes ({len(historique)})</b>\n"]
+    for d in historique[:10]:
+        lines.append(f"• <a href='{d['url']}'>{d['titre'][:30]}</a> — {d['score']}/100 | {d['prix']}€")
+    return "\n".join(lines)
+
+def panel_historique_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Retour", callback_data="view_main")]])
+
+def panel_marques_text():
+    return (
+        f"🏷️ <b>Marques ({len(config['marques'])} actives)</b>\n\n"
+        f"Pour modifier : tape une commande\n\n"
+        f"/marque add &lt;nom&gt;\n"
+        f"/marque remove &lt;nom&gt;\n"
+        f"/marque reset — tout réactiver\n"
+        f"/marque list — voir toutes"
+    )
+
+def panel_marques_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Reset marques", callback_data="marques_reset")],
+        [InlineKeyboardButton("◀️ Retour",        callback_data="view_main")],
+    ])
+
+VIEWS = {
+    "main":       (panel_main_text,       panel_main_kb),
+    "cooldown":   (panel_cooldown_text,   panel_cooldown_kb),
+    "budget":     (panel_budget_text,     panel_budget_kb),
+    "score":      (panel_score_text,      panel_score_kb),
+    "favoris":    (panel_favoris_text,    panel_favoris_kb),
+    "historique": (panel_historique_text, panel_historique_kb),
+    "marques":    (panel_marques_text,    panel_marques_kb),
 }
 
-async def afficher_menu(query, menu: str = "main"):
-    text_fn, kb_fn = MENUS.get(menu, MENUS["main"])
+async def _render_panel(query, view="main"):
+    txt_fn, kb_fn = VIEWS.get(view, VIEWS["main"])
     try:
         await query.edit_message_text(
-            text_fn(),
-            reply_markup=kb_fn(),
-            parse_mode="HTML",
+            txt_fn(), reply_markup=kb_fn(), parse_mode="HTML",
             disable_web_page_preview=True,
         )
     except Exception:
         pass
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  COMMANDES TELEGRAM
+#  HANDLERS CALLBACKS
+# ══════════════════════════════════════════════════════════════════════════════
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    data = q.data
+    await q.answer()
+
+    # Navigation vues
+    if data.startswith("view_"):
+        view = data[5:]
+        await _render_panel(q, view)
+        return
+
+    # Contrôle scan
+    if data == "panel_start":
+        config["actif"] = True
+    elif data == "panel_pause":
+        config["actif"] = False
+    elif data == "panel_stop":
+        config["actif"] = False
+        await q.edit_message_text("⛔ Bot arrêté. Railway va le redémarrer automatiquement.")
+        sys.exit(0)
+    elif data == "panel_refresh":
+        pass
+    elif data == "panel_reset":
+        config.update({"msg_cooldown": 1, "prix_min": 3.0, "prix_max": 200.0,
+                       "score_min": 60, "marques": set(TOUTES_LES_MARQUES)})
+
+    # Cooldown msg
+    elif data.startswith("cd_"):
+        config["msg_cooldown"] = int(data.split("_")[1])
+        await _render_panel(q, "cooldown"); return
+
+    # Budget
+    elif data.startswith("budget_"):
+        _, pmin, pmax = data.split("_")
+        config["prix_min"] = float(pmin); config["prix_max"] = float(pmax)
+        await _render_panel(q, "budget"); return
+
+    # Score
+    elif data.startswith("score_"):
+        suffix = data[6:]
+        if suffix == "up":
+            config["score_min"] = min(95, config["score_min"] + 5)
+        elif suffix == "down":
+            config["score_min"] = max(30, config["score_min"] - 5)
+        else:
+            config["score_min"] = int(suffix)
+        await _render_panel(q, "score"); return
+
+    # Marques
+    elif data == "marques_reset":
+        config["marques"] = set(TOUTES_LES_MARQUES)
+        await _render_panel(q, "marques"); return
+
+    # Favoris
+    elif data.startswith("fav_add_"):
+        item_id = data[8:]
+        match = next((d for d in historique if str(d.get("item_id")) == item_id), None)
+        if match and match not in favoris:
+            favoris.insert(0, match)
+            await q.answer("⭐ Ajouté aux favoris !", show_alert=True)
+        else:
+            await q.answer("Déjà dans les favoris.", show_alert=True)
+        return
+    elif data == "fav_clear":
+        favoris.clear()
+        await _render_panel(q, "favoris"); return
+
+    await _render_panel(q, "main")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMMANDES TEXTE
 # ══════════════════════════════════════════════════════════════════════════════
 async def cmd_bot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text_fn, kb_fn = MENUS["main"]
-    await update.message.reply_text(
-        text_fn(), reply_markup=kb_fn(), parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    txt_fn, kb_fn = VIEWS["main"]
+    await update.message.reply_text(txt_fn(), reply_markup=kb_fn(), parse_mode="HTML",
+                                    disable_web_page_preview=True)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     config["actif"] = True
-    await update.message.reply_text("✅ <b>Scan activé !</b>", parse_mode="HTML")
+    await update.message.reply_text("✅ <b>Scan activé !</b>  Tape /bot pour le panel.", parse_mode="HTML")
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     config["actif"] = False
-    await update.message.reply_text("⏸ <b>Scan mis en pause.</b>\nTape /start pour relancer.", parse_mode="HTML")
+    await update.message.reply_text("⏸ <b>Scan en pause.</b>  Tape /start pour relancer.", parse_mode="HTML")
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        build_main_text() + "\n\n👉 Tape /bot pour le panel interactif",
-        parse_mode="HTML",
-    )
+async def cmd_cooldown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        s = int(ctx.args[0]); assert s >= 1
+        config["msg_cooldown"] = s
+        await update.message.reply_text(f"⏱️ Cooldown msg : <b>{s}s</b>", parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text("❌ Usage : /cooldown &lt;secondes&gt;  ex: /cooldown 2")
 
 async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
@@ -695,24 +653,28 @@ async def cmd_budget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("❌ Usage : /budget &lt;min&gt; &lt;max&gt;  ex: /budget 5 150")
 
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(panel_main_text(), parse_mode="HTML",
+                                    reply_markup=panel_main_kb(), disable_web_page_preview=True)
+
 async def cmd_marque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         action = ctx.args[0].lower()
     except IndexError:
         await update.message.reply_text("Usage :\n/marque add &lt;nom&gt;\n/marque remove &lt;nom&gt;\n/marque reset\n/marque list")
         return
-
     if action == "reset":
         config["marques"] = set(TOUTES_LES_MARQUES)
         await update.message.reply_text(f"✅ {len(config['marques'])} marques réactivées.")
     elif action == "list":
-        texte = "🏷️ <b>Marques actives :</b>\n" + ", ".join(sorted(config["marques"]))
-        await update.message.reply_text(texte[:4000], parse_mode="HTML")
+        await update.message.reply_text(
+            "🏷️ <b>Marques actives :</b>\n" + ", ".join(sorted(config["marques"])),
+            parse_mode="HTML"
+        )
     elif action in ("add", "remove"):
         nom = " ".join(ctx.args[1:]).lower().strip()
         if not nom:
-            await update.message.reply_text(f"❌ Usage : /marque {action} &lt;nom&gt;")
-            return
+            await update.message.reply_text(f"❌ Usage : /marque {action} &lt;nom&gt;"); return
         if action == "add":
             config["marques"].add(nom)
             await update.message.reply_text(f"✅ Ajouté : <b>{nom}</b>", parse_mode="HTML")
@@ -721,108 +683,6 @@ async def cmd_marque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🗑️ Retiré : <b>{nom}</b>", parse_mode="HTML")
     else:
         await update.message.reply_text("❌ Action inconnue : add / remove / reset / list")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  CALLBACK HANDLER
-# ══════════════════════════════════════════════════════════════════════════════
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    # ── Navigation menus ──────────────────────────────────────
-    if data.startswith("menu_"):
-        menu = data.split("_", 1)[1]
-        await afficher_menu(query, menu)
-        return
-
-    # ── Contrôle scan ─────────────────────────────────────────
-    if data == "panel_start":
-        config["actif"] = True
-    elif data == "panel_pause":
-        config["actif"] = False
-    elif data == "panel_stop":
-        config["actif"] = False
-        await query.edit_message_text("⛔ Bot arrêté. Railway va le redémarrer automatiquement.")
-        sys.exit(0)
-    elif data == "panel_reset":
-        config.update({
-            "msg_cooldown": 1,
-            "prix_min": 3.0,
-            "prix_max": 200.0,
-            "score_min": 60,
-            "marques": set(TOUTES_LES_MARQUES),
-        })
-
-    # ── Cooldown messages ─────────────────────────────────────
-    elif data.startswith("msgcd_"):
-        config["msg_cooldown"] = int(data.split("_")[1])
-        await afficher_menu(query, "scan")
-        return
-
-    # ── Budget ────────────────────────────────────────────────
-    elif data.startswith("budget_"):
-        _, pmin, pmax = data.split("_")
-        config["prix_min"] = float(pmin)
-        config["prix_max"] = float(pmax)
-        await afficher_menu(query, "budget")
-        return
-
-    # ── Score ─────────────────────────────────────────────────
-    elif data == "score_up":
-        config["score_min"] = min(95, config["score_min"] + 5)
-        await afficher_menu(query, "score")
-        return
-    elif data == "score_down":
-        config["score_min"] = max(30, config["score_min"] - 5)
-        await afficher_menu(query, "score")
-        return
-    elif data.startswith("score_set_"):
-        config["score_min"] = int(data.split("_")[2])
-        await afficher_menu(query, "score")
-        return
-
-    # ── Marques ───────────────────────────────────────────────
-    elif data == "marques_reset":
-        config["marques"] = set(TOUTES_LES_MARQUES)
-        await afficher_menu(query, "marques")
-        return
-
-    # ── Historique ────────────────────────────────────────────
-    elif data == "historique_clear":
-        historique_alertes.clear()
-        await afficher_menu(query, "historique")
-        return
-
-    # ── Favoris ───────────────────────────────────────────────
-    elif data.startswith("fav_add_"):
-        item_id_str = data.split("_", 2)[2]
-        # Cherche dans l'historique
-        trouve = next((d for d in historique_alertes if str(d.get("id")) == item_id_str), None)
-        if trouve and trouve not in favoris:
-            favoris.append(trouve)
-            await query.answer("⭐ Ajouté aux favoris !", show_alert=True)
-        elif trouve in favoris:
-            await query.answer("Déjà dans les favoris.", show_alert=True)
-        else:
-            await query.answer("Introuvable dans l'historique.", show_alert=True)
-        return
-    elif data.startswith("fav_del_"):
-        idx = int(data.split("_")[2])
-        if 0 <= idx < len(favoris):
-            favoris.pop(idx)
-        await afficher_menu(query, "favoris")
-        return
-    elif data == "fav_clear":
-        favoris.clear()
-        await afficher_menu(query, "favoris")
-        return
-
-    elif data == "noop":
-        return
-
-    # ── Rafraîchissement du panel principal ───────────────────
-    await afficher_menu(query, "main")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DÉMARRAGE
@@ -834,10 +694,9 @@ async def post_init(app: Application):
         text=(
             "🤖 <b>Bot Vinted prêt !</b>\n\n"
             f"🏷️ {len(config['marques'])} marques chargées\n"
-            f"📨 Cooldown messages : {config['msg_cooldown']}s\n"
+            f"⏱️ Cooldown msg : {config['msg_cooldown']}s\n"
             f"💶 Budget : {config['prix_min']}€ – {config['prix_max']}€\n"
-            f"🎯 Score min : {config['score_min']}/100\n"
-            f"⚡ Scan continu activé\n\n"
+            f"🎯 Score min : {config['score_min']}/100\n\n"
             "👉 Tape /bot pour ouvrir le panel\n"
             "👉 Tape /start pour lancer le scan"
         ),
@@ -851,12 +710,13 @@ def main():
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("bot",     cmd_bot))
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
-    app.add_handler(CommandHandler("budget",  cmd_budget))
-    app.add_handler(CommandHandler("marque",  cmd_marque))
-    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("bot",      cmd_bot))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("cooldown", cmd_cooldown))
+    app.add_handler(CommandHandler("budget",   cmd_budget))
+    app.add_handler(CommandHandler("marque",   cmd_marque))
+    app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     print("📡 Bot en écoute…")
@@ -864,3 +724,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ENDOFFILE
